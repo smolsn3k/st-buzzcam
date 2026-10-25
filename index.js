@@ -3,7 +3,7 @@
 import { getContext, extension_settings } from '../../../extensions.js';
 
 const MOD = 'buzzcam';
-const DEF = { profileId: '', summaryProfileId: '', popularity: 0, wallet: 0, rate: 0.01, currency: 'USD', phoneLink: false, botMods: true, inject: true, echo: false, autoGen: true, floatBtn: true, maxEvents: 6, cashed: 0 };
+const DEF = { profileId: '', summaryProfileId: '', popularity: 0, wallet: 0, rate: 0.01, currency: 'USD', phoneLink: false, botMods: true, inject: true, echo: false, chatMode: 'auto', commentMode: 'auto', streamerWho: 'char', floatBtn: true, maxEvents: 6, cashed: 0 };
 const GRADES = [
     { n: 'Beginner', v: [3, 40], s: [4, 90], ev: [1, 3], d: 'a small new streamer with a handful of regulars; chat is quiet and friendly, tips are small' },
     { n: 'Rising', v: [60, 500], s: [150, 1500], ev: [3, 5], d: 'a growing streamer with a loyal chat; steady chatter and regular tips' },
@@ -35,7 +35,8 @@ function initSettings() { extension_settings[MOD] = Object.assign({}, DEF, exten
 function newChat() { return { on: true, p: { name: '', avatar: '', thumb: '', bio: '', schedule: '', tags: '', bounds: '', consent18: false, consentExplicit: false }, posts: [], cast: [], hist: [], subs: 0, subsG: -1, st: null }; }
 function C() { const md = ctx().chatMetadata; if (!md) return null; if (!md[MOD]) md[MOD] = newChat(); return md[MOD]; }
 function save() { const c = ctx(); (c.saveMetadataDebounced || c.saveMetadata)?.call(c); }
-const streamer = () => C()?.p.name || ctx().name2 || 'Streamer';
+const defName = () => { const w = S().streamerWho, x = ctx(); return w === 'user' ? x.name1 : w === 'both' ? `${x.name2} & ${x.name1}` : x.name2; };
+const streamer = () => C()?.p.name || defName() || 'Streamer';
 const profiles = () => (extension_settings.connectionManager?.profiles || []).filter(p => p && p.id);
 function ensureSubs() { const c = C(), g = GRADES[S().popularity]; if (c.subsG !== S().popularity) { c.subs = rnd(g.s[0], g.s[1]); c.subsG = S().popularity; save(); } }
 const memberOf = n => C().cast.find(m => m.name.toLowerCase() === String(n).toLowerCase());
@@ -54,7 +55,17 @@ async function phoneDeposit(amount, note) {
 const curCode = () => (S().phoneLink && phoneCurrency()) || S().currency;
 
 /* ---------- LLM ---------- */
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function waitIdle() { for (let i = 0; i < 60; i++) { const b = document.getElementById('mes_stop'); if (!b || b.offsetParent === null) return; await sleep(500); } }
 async function callLLM(pid, sys, usr, max) {
+    await waitIdle();
+    try { return await callOnce(pid, sys, usr, max); }
+    catch (e) {
+        if (!/abort/i.test(String(e?.name || '') + String(e?.message || e))) throw e;
+        await sleep(2500); await waitIdle(); return await callOnce(pid, sys, usr, max);
+    }
+}
+async function callOnce(pid, sys, usr, max) {
     const c = ctx();
     if (pid && c.ConnectionManagerRequestService) {
         const r = await c.ConnectionManagerRequestService.sendRequest(pid, [{ role: 'system', content: sys }, { role: 'user', content: usr }], max, { extractData: true, includePreset: true, includeInstruct: false });
@@ -105,6 +116,7 @@ function applyEvent(ev) {
 }
 function capture(id) {
     const c = C(); if (!c || !c.on || !c.st) return false; const m = ctx().chat[id]; if (!m || m.is_system) return false;
+    const w = S().streamerWho; if ((w === 'char' && m.is_user) || (w === 'user' && !m.is_user)) return false;
     const text = clean(m.mes); if (!text) return false; const who = m.name || (m.is_user ? ctx().name1 : ctx().name2), b = c.st.buf, ex = b.find(x => x.id === id);
     if (ex) { ex.text = text; ex.who = who; } else b.push({ id, who, text }); if (b.length > 80) b.shift(); save(); return true;
 }
@@ -139,7 +151,7 @@ Write ${n} new events reacting to the latest part of the scene.`;
         arr.slice(0, n + 2).forEach(applyEvent);
         if (st.auto) { const r = pv ? [1, Math.max(1, c.subs)] : g.v; st.viewers = clamp(Math.round(st.viewers * (1 + (Math.random() - 0.42) * 0.12)), r[0], r[1]); }
         st.peak = Math.max(st.peak, st.viewers); st.gen++;
-    } catch (e) { console.warn('[BuzzCam]', e); feed({ t: 'sys', text: 'Chat simulation failed: ' + (e.message || e) }); }
+    } catch (e) { console.warn('[BuzzCam]', e); feed({ t: 'sys', text: 'Chat simulation failed: ' + (e.message || e) }); toastr.error('BuzzCam chat failed: ' + (e.message || e)); }
     finally { busy = false; $q('#bz-root')?.classList.remove('bz-busy'); save(); live(); if (dirty) { dirty = false; setTimeout(genViewers, 400); } }
 }
 function inject() {
@@ -183,6 +195,19 @@ async function summarize(id) {
     } catch (e) { toastr.error('Summary failed: ' + (e.message || e)); }
     h.busy = 0; save(); view();
 }
+async function genComments(id) {
+    const c = C(), p = c.posts.find(x => x.id === id); if (!p || p.busy) return; p.busy = 1; view();
+    try {
+        const g = GRADES[S().popularity], n = clamp(rnd(g.ev[0], g.ev[1]), 2, 6);
+        const cast = c.cast.map(m => `- ${m.name} [${m.role}] ${m.persona || ''}`).join('\n') || '(no named cast; invent followers)';
+        const sys = `You write follower comments under a post on BuzzCam, a fictional adult-only (18+) streaming site inside a roleplay. Everyone is a fictional adult; explicit language is fine when it fits. Comment only on what the post shows. Reply with a JSON array and nothing else: [{"name":"","text":""}]. Short, varied comments (under 200 characters), honey/bee flavoured usernames allowed, same language as the post.${p.subs ? ' This is a subscribers-only post, so commenters are paying subscribers.' : ''}
+Known cast (may comment in character):\n${cast}`;
+        const usr = `Streamer: ${streamer()}. Level: ${g.n}. Boundaries: ${c.p.bounds || 'none stated'}.\nPost: ${p.text || '(no text)'}\n${p.img ? 'Image: ' + (p.desc || '(attached, not described)') : ''}\nExisting comments:\n${(p.comments || []).slice(-5).map(k => `${k.name}: ${k.text}`).join('\n') || 'none'}\nWrite ${n} new comments.`;
+        const arr = parseEvents(await callLLM(S().profileId, sys, usr, 600)).filter(k => k && k.name && k.text);
+        p.comments = (p.comments || []).concat(arr.slice(0, n + 2).map(k => ({ name: String(k.name).slice(0, 32), text: String(k.text).slice(0, 300) }))).slice(-40);
+    } catch (e) { toastr.error('Comments failed: ' + (e.message || e)); }
+    p.busy = 0; save(); view();
+}
 async function cashOut() {
     const s = S(), amt = Math.floor(+$q('#bz-cash')?.value || 0);
     if (!(amt > 0) || amt > s.wallet) return toastr.warning('Enter an amount up to your balance.');
@@ -207,9 +232,9 @@ function vProfile() {
     const ver = p.consent18 ? `<span class="bz-ver"><i class="fa-solid fa-circle-check"></i> 18+ verified (fictional)</span>` : `<span class="bz-chip warn">Not verified yet</span>`;
     return `<div class="bz-card bz-chan"><div class="bz-banner" style="${p.thumb ? `background-image:url('${p.thumb}')` : ''}"><label class="bz-chip bz-up"><i class="fa-solid fa-image"></i> Thumbnail<input type="file" accept="image/*" hidden data-img="thumb"></label></div>
 <div class="bz-chanrow"><div class="bz-hexav" style="${p.avatar ? `background-image:url('${p.avatar}')` : ''}"><label class="bz-hexup"><i class="fa-solid fa-camera"></i><input type="file" accept="image/*" hidden data-img="avatar"></label></div>
-<div class="bz-chaninfo"><h2>${esc(p.name || ctx().name2 || 'Streamer')} ${ver}</h2><div class="bz-meta"><span>${fmt(c.subs)} subscribers</span><span>${g.n} streamer</span><span>${c.hist.length} past streams</span></div><div class="bz-tags">${String(p.tags).split(',').map(t => t.trim()).filter(Boolean).map(t => chip('#' + t)).join('')}</div></div></div></div>
+<div class="bz-chaninfo"><h2>${esc(p.name || defName() || 'Streamer')} ${ver}</h2><div class="bz-meta"><span>${fmt(c.subs)} subscribers</span><span>${g.n} streamer</span><span>${c.hist.length} past streams</span></div><div class="bz-tags">${String(p.tags).split(',').map(t => t.trim()).filter(Boolean).map(t => chip('#' + t)).join('')}</div></div></div></div>
 <div class="bz-cols"><div class="bz-card"><h3>Profile</h3>
-<label>Username<input data-p="name" value="${esc(p.name)}" placeholder="${esc(ctx().name2 || 'Streamer')}"></label>
+<label>Username<input data-p="name" value="${esc(p.name)}" placeholder="${esc(defName() || 'Streamer')}"></label>
 <label>Bio<textarea data-p="bio" rows="3">${esc(p.bio)}</textarea></label>
 <label>Schedule<input data-p="schedule" value="${esc(p.schedule)}" placeholder="Fri and Sat nights, 22:00"></label>
 <label>Tags (comma separated)<input data-p="tags" value="${esc(p.tags)}" placeholder="cozy, roleplay, late night"></label></div>
@@ -221,7 +246,7 @@ function vProfile() {
 }
 function vCommunity() {
     const c = C(), p = c.p, av = p.avatar ? `style="background-image:url('${p.avatar}')"` : '';
-    const posts = c.posts.slice().reverse().map(x => `<article class="bz-card bz-post"><div class="bz-ph"><span class="bz-hexs" ${av}></span><b>${esc(streamer())}</b><time>${new Date(x.ts).toLocaleString()}</time>${x.subs ? `<span class="bz-chip lock"><i class="fa-solid fa-lock"></i> Subscribers only</span>` : chip('Public')}<button class="bz-ic" data-act="post-del" data-id="${x.id}" title="Delete"><i class="fa-solid fa-trash"></i></button></div><p>${esc(x.text)}</p>${x.img ? `<img class="bz-pimg" src="${x.img}">` : ''}${x.desc ? `<small class="bz-alt">${esc(x.desc)}</small>` : ''}</article>`).join('');
+    const posts = c.posts.slice().reverse().map(x => `<article class="bz-card bz-post"><div class="bz-ph"><span class="bz-hexs" ${av}></span><b>${esc(streamer())}</b><time>${new Date(x.ts).toLocaleString()}</time>${x.subs ? `<span class="bz-chip lock"><i class="fa-solid fa-lock"></i> Subscribers only</span>` : chip('Public')}<button class="bz-ic" data-act="post-del" data-id="${x.id}" title="Delete"><i class="fa-solid fa-trash"></i></button></div><p>${esc(x.text)}</p>${x.img ? `<img class="bz-pimg" src="${x.img}">` : ''}${x.desc ? `<small class="bz-alt">${esc(x.desc)}</small>` : ''}${(x.comments || []).length ? `<div class="bz-cm">${x.comments.map(k => `<p><b>${esc(k.name)}</b> ${esc(k.text)}</p>`).join('')}</div>` : ''}<button class="bz-link" data-act="post-com" data-id="${x.id}" ${x.busy ? 'disabled' : ''}>${x.busy ? 'Generating comments…' : (x.comments || []).length ? 'More comments' : 'Generate comments'}</button></article>`).join('');
     return `<div class="bz-card"><h3>New post</h3><textarea id="bz-ptext" rows="3" placeholder="Write something for your followers">${esc(draft.text)}</textarea>
 ${draft.img ? `<div class="bz-prev"><img src="${draft.img}"><button class="bz-ic" data-act="img-clear" title="Remove image"><i class="fa-solid fa-xmark"></i></button></div>` : ''}
 <input id="bz-pdesc" placeholder="Image description (optional, for models that can't see images)" value="${esc(draft.desc)}">
@@ -272,13 +297,14 @@ ${m.role === 'subscriber' || m.role === 'patron' ? `<label class="bz-inl">Tier <
 }
 function vSettings() {
     const s = S(), ps = profiles(), opt = sel => `<option value="">Current connection</option>` + ps.map(p => `<option value="${esc(p.id)}" ${p.id === sel ? 'selected' : ''}>${esc(p.name)}</option>`).join('');
+    const sel = (k, l, o) => `<label>${l}<select data-set="${k}">${o.map(([v, n]) => `<option value="${v}" ${s[k] === v ? 'selected' : ''}>${n}</option>`).join('')}</select></label>`;
     const tg = (k, t) => `<label class="bz-chk"><input type="checkbox" data-set="${k}" ${s[k] ? 'checked' : ''}><span>${t}</span></label>`;
     return `<div class="bz-cols"><div class="bz-card"><h3>Models</h3><label>Viewer chat profile<select data-set="profileId">${opt(s.profileId)}</select></label><label>Stream summary profile<select data-set="summaryProfileId">${opt(s.summaryProfileId)}</select></label>${ps.length ? '' : '<p class="bz-note">No connection profiles found. BuzzCam will use your current connection.</p>'}
 <h3>Popularity</h3><div class="bz-seg">${GRADES.map((g, i) => `<button data-act="pop" data-n="${i}" class="${s.popularity === i ? 'on' : ''}"><b>${g.n}</b><span>${fmt(g.v[0])} to ${fmt(g.v[1])} viewers</span></button>`).join('')}</div>
 <p class="bz-note">Sets viewer and subscriber counts, chat speed and tip size.</p></div>
 <div class="bz-card"><h3>Honey Tokens</h3><div class="bz-grid2"><label>Money per token<input type="number" step="0.001" min="0" data-set="rate" value="${s.rate}"></label><label>Currency${s.phoneLink && phoneCurrency() ? ' (from phone)' : ''}<input data-set="currency" value="${esc(curCode())}" ${s.phoneLink && phoneCurrency() ? 'disabled' : ''}></label></div>
 ${tg('phoneLink', 'Link with Phone-ST bank')}<div class="bz-row"><button class="bz-btn ghost" data-act="phone-test">Test phone link</button></div><div id="bz-ptest" class="bz-note"></div>
-<h3>Behaviour</h3>${tg('autoGen', 'Generate viewer chat after each roleplay message')}${tg('botMods', 'Bot moderators can mute and ban')}${tg('inject', 'Let the character see chat, tips and accepted requests')}${tg('echo', 'Post tips into the main chat as system messages')}${tg('floatBtn', 'Show floating button')}
+<h3>Behaviour</h3>${sel('streamerWho', 'Who is the streamer', [['char', 'The character (bot)'], ['user', 'The user'], ['both', 'Both']])}<p class="bz-note">Only the streamer's messages are on camera. Choose Both to show everyone in the chat.</p>${sel('chatMode', 'Viewer chat generation', [['auto', 'Automatic after each message'], ['manual', 'Manual (button in the stream room)']])}${sel('commentMode', 'Post comments generation', [['auto', 'Automatic when a post is published'], ['manual', 'Manual (button on each post)']])}${tg('botMods', 'Bot moderators can mute and ban')}${tg('inject', 'Let the character see chat, tips and accepted requests')}${tg('echo', 'Post tips into the main chat as system messages')}${tg('floatBtn', 'Show floating button')}
 <label>Max events per round<input type="number" min="1" max="12" data-set="maxEvents" value="${s.maxEvents}"></label><button class="bz-link" data-act="fab-reset">Reset floating button position</button></div></div>`;
 }
 const feedRow = f => {
@@ -339,8 +365,9 @@ const ACT = {
     'goal-reset': () => { const st = C().st; st.goal.cur = 0; st.goalHit = false; save(); live(); },
     'post-add': () => {
         const c = C(), text = ($q('#bz-ptext').value || '').trim(); if (!text && !draft.img) return;
-        c.posts.push({ id: uid(), ts: Date.now(), text, img: draft.img, desc: ($q('#bz-pdesc').value || '').trim(), subs: $q('#bz-paud').value === 'subs' }); draft = { img: '', text: '', desc: '' }; save(); view();
+        const pid = uid(); c.posts.push({ id: pid, ts: Date.now(), text, img: draft.img, desc: ($q('#bz-pdesc').value || '').trim(), subs: $q('#bz-paud').value === 'subs' }); draft = { img: '', text: '', desc: '' }; save(); view(); if (S().commentMode === 'auto') genComments(pid);
     },
+    'post-com': (t, id) => genComments(id),
     'post-del': (t, id) => { const c = C(); c.posts = c.posts.filter(x => x.id !== id); save(); view(); },
     'img-clear': () => { stash(); draft.img = ''; view(); },
     'hist-sum': (t, id) => summarize(id), 'hist-del': (t, id) => { if (confirm('Delete this stream from history?')) { const c = C(); c.hist = c.hist.filter(x => x.id !== id); save(); view(); } },
@@ -371,9 +398,9 @@ function onField(e) {
     const val = t.type === 'checkbox' ? t.checked : t.value, c = C();
     if (t.id === 'bz-f-mode') { $q('#bz-tierbox').hidden = val !== 'tier'; $q('#bz-patbox').hidden = val !== 'patron'; return; }
     if (d.cash !== undefined) { $q('#bz-cashp').textContent = `${((+val || 0) * S().rate).toFixed(2)} ${curCode()}`; return; }
-    if (d.set) { const s = S(); s[d.set] = typeof DEF[d.set] === 'number' ? (parseFloat(val) || 0) : val; saveS(); if (d.set === 'floatBtn') fab(); if (d.set === 'inject') inject(); if (d.set === 'phoneLink' || d.set === 'botMods') view(); return; }
+    if (d.set) { const s = S(); s[d.set] = typeof DEF[d.set] === 'number' ? (parseFloat(val) || 0) : val; saveS(); if (d.set === 'floatBtn') fab(); if (d.set === 'inject') inject(); if (d.set === 'streamerWho') { inject(); view(); } if (d.set === 'phoneLink' || d.set === 'botMods') view(); return; }
     if (!c) return;
-    if (d.p) { c.p[d.p] = val; save(); if (d.p === 'name' || d.p === 'consent18') { const h = $q('.bz-chaninfo h2'); if (d.p === 'consent18') view(); else if (h) h.firstChild.textContent = (val || ctx().name2 || 'Streamer') + ' '; } return; }
+    if (d.p) { c.p[d.p] = val; save(); if (d.p === 'name' || d.p === 'consent18') { const h = $q('.bz-chaninfo h2'); if (d.p === 'consent18') view(); else if (h) h.firstChild.textContent = (val || defName() || 'Streamer') + ' '; } return; }
     if (d.cm) {
         const m = c.cast.find(x => x.id === d.id); if (!m) return;
         if (d.cm.startsWith('perm_')) (m.perms ||= { ...ROLES[m.role] })[d.cm.slice(5)] = val ? 1 : 0;
@@ -435,11 +462,11 @@ function hooks() {
     const x = ctx(), E = x.eventSource, T = x.event_types;
     E.on(T.MESSAGE_RECEIVED, (id, type) => {
         const st = C()?.st; if (st) { st.don.forEach(d => { if (d.state === 'sent') d.state = 'read'; }); }
-        if (capture(id) && type !== 'swipe' && S().autoGen) setTimeout(genViewers, 600); inject(); live();
+        if (capture(id) && type !== 'swipe' && S().chatMode === 'auto') setTimeout(genViewers, 1500); inject(); live();
     });
     E.on(T.MESSAGE_SENT, id => capture(id));
     E.on(T.GENERATION_STARTED, (type, p, dry) => { if (dry || type === 'quiet') return; C()?.st?.don.forEach(d => { if (d.state === 'new') d.state = 'sent'; }); inject(); });
-    E.on(T.CHAT_CHANGED, () => { C()?.hist.forEach(h => { h.busy = 0; }); draft = { img: '', text: '', desc: '' }; busy = false; inject(); fabState(); view(); head(); });
+    E.on(T.CHAT_CHANGED, () => { C()?.hist.forEach(h => { h.busy = 0; }); C()?.posts.forEach(x => { x.busy = 0; }); draft = { img: '', text: '', desc: '' }; busy = false; inject(); fabState(); view(); head(); });
 }
 
 jQuery(() => {

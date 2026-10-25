@@ -148,3 +148,6 @@
     #bz-feed { height: 280px; }
     .bz-mb { opacity: .8; }
 }
+.bz-cm { margin: 8px 0 2px; padding-left: 10px; border-left: 3px solid var(--line); }
+.bz-cm p { margin: 4px 0; font-size: .9em; line-height: 1.4; }
+.bz-cm b { color: var(--honey); }
