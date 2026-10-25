@@ -3,7 +3,7 @@
 import { getContext, extension_settings } from '../../../extensions.js';
 
 const MOD = 'buzzcam';
-const DEF = { profileId: '', summaryProfileId: '', popularity: 0, wallet: 0, rate: 0.01, currency: 'USD', phoneLink: false, botMods: true, inject: true, echo: false, chatMode: 'auto', commentMode: 'auto', streamerWho: 'char', floatBtn: true, maxEvents: 6, cashed: 0 };
+const DEF = { profileId: '', summaryProfileId: '', popularity: 0, wallet: 0, rate: 0.01, currency: 'USD', phoneLink: false, botMods: true, inject: true, echo: false, chatMode: 'auto', commentMode: 'auto', streamerWho: 'char', floatBtn: true, maxEvents: 6, cashed: 0, minPerMsg: 5 };
 const GRADES = [
     { n: 'Beginner', v: [3, 40], s: [4, 90], ev: [1, 3], d: 'a small new streamer with a handful of regulars; chat is quiet and friendly, tips are small' },
     { n: 'Rising', v: [60, 500], s: [150, 1500], ev: [3, 5], d: 'a growing streamer with a loyal chat; steady chatter and regular tips' },
@@ -15,7 +15,7 @@ const ROLES = { viewer: { tip: 1, request: 1, moderate: 0 }, subscriber: { tip: 
 const ROLEI = { mod: 'fa-shield-halved', cohost: 'fa-microphone', subscriber: 'fa-star', patron: 'fa-crown' };
 const TABS = [['profile', 'Channel', 'fa-id-badge'], ['community', 'Community', 'fa-newspaper'], ['stream', 'Stream room', 'fa-video'], ['history', 'History', 'fa-clock-rotate-left'], ['cast', 'Cast', 'fa-users'], ['settings', 'Settings', 'fa-gear']];
 
-let tab = 'profile', isOpen = false, busy = false, dirty = false, draft = { img: '', text: '', desc: '' };
+let stGen = false, tab = 'profile', isOpen = false, busy = false, dirty = false, draft = { img: '', text: '', desc: '' };
 
 /* ---------- helpers ---------- */
 const ctx = () => getContext();
@@ -52,30 +52,54 @@ async function phoneDeposit(amount, note) {
     }
     return false;
 }
+function parseTime(t) {
+    let best = null, x; const re = /\b(\d{1,2}):(\d{2})\s*([ap])\.?m\b\.?|\b(\d{1,2}):(\d{2})\b/gi;
+    while ((x = re.exec(t))) {
+        let h = +(x[1] ?? x[4]), mi = +(x[2] ?? x[5]); if (mi > 59) continue;
+        if (x[3]) { if (h < 1 || h > 12) continue; h = h % 12 + (x[3].toLowerCase() === 'p' ? 12 : 0); } else if (h > 23) continue;
+        best = h * 60 + mi;
+    }
+    return best;
+}
+function readClock() {
+    try { const H = window.Horae; if (H) { const v = H.story_time ?? H.getStoryTime?.() ?? H.getState?.()?.story_time ?? H.state?.story_time; const m = parseTime(String(v ?? '')); if (m != null) return m; } } catch { /* ignore */ }
+    const ch = ctx().chat || [];
+    for (let i = ch.length - 1; i >= Math.max(0, ch.length - 4); i--) { const m = parseTime(String(ch[i]?.mes || '').replace(/<[^>]+>/g, ' ')); if (m != null) return m; }
+    return null;
+}
+function tickClock() {
+    const st = C()?.st; if (!st) return; const t = readClock(); if (t == null) return; const k = st.clk;
+    if (!k) { st.clk = { base: t, last: t, wraps: 0 }; return; }
+    if (t < k.last - 120) { k.wraps++; k.last = t; } else if (t > k.last) k.last = t;
+}
+function uptimeMin() { const st = C()?.st; if (!st) return 0; const k = st.clk; return k ? Math.max(0, k.wraps * 1440 + k.last - k.base) : (st.msgs || 0) * S().minPerMsg; }
+const fmtMin = m => { m = Math.round(m); return m >= 60 ? `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m` : `${m}m`; };
 const curCode = () => (S().phoneLink && phoneCurrency()) || S().currency;
 
 /* ---------- LLM ---------- */
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-async function waitIdle() { for (let i = 0; i < 60; i++) { const b = document.getElementById('mes_stop'); if (!b || b.offsetParent === null) return; await sleep(500); } }
+async function waitIdle() { for (let i = 0; i < 40 && stGen; i++) await sleep(500); }
+const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rj) => setTimeout(() => rj(new Error(`The model did not answer within ${ms / 1000}s`)), ms))]);
+const norm = r => typeof r === 'string' ? r : Array.isArray(r) ? r.map(norm).join('') : r == null ? '' : (r.content !== undefined ? norm(r.content) : (r.choices?.[0]?.message?.content ?? r.text ?? ''));
 async function callLLM(pid, sys, usr, max) {
     await waitIdle();
-    try { return await callOnce(pid, sys, usr, max); }
+    try { return await withTimeout(callOnce(pid, sys, usr, max), 120000); }
     catch (e) {
         if (!/abort/i.test(String(e?.name || '') + String(e?.message || e))) throw e;
-        await sleep(2500); await waitIdle(); return await callOnce(pid, sys, usr, max);
+        console.warn('[BuzzCam] request aborted, retrying once'); await sleep(2500); await waitIdle(); return await withTimeout(callOnce(pid, sys, usr, max), 120000);
     }
 }
 async function callOnce(pid, sys, usr, max) {
     const c = ctx();
     if (pid && c.ConnectionManagerRequestService) {
         const r = await c.ConnectionManagerRequestService.sendRequest(pid, [{ role: 'system', content: sys }, { role: 'user', content: usr }], max, { extractData: true, includePreset: true, includeInstruct: false });
-        return typeof r === 'string' ? r : (r?.content ?? '');
+        return norm(r);
     }
-    try { return await c.generateRaw({ prompt: usr, systemPrompt: sys, responseLength: max }); }
-    catch { return await c.generateRaw(usr, null, false, false, sys, max); }
+    try { return norm(await c.generateRaw({ prompt: usr, systemPrompt: sys, responseLength: max })); }
+    catch (e) { if (/abort/i.test(String(e?.name || e?.message || e))) throw e; return norm(await c.generateRaw(usr, null, false, false, sys, max)); }
 }
 function parseEvents(raw) {
-    let t = String(raw || '').replace(/```(json)?/gi, '');
+    let t = String(raw || '').replace(/<think(ing)?>[\s\S]*?<\/think(ing)?>/gi, '').replace(/```(json)?/gi, '');
     const a = t.indexOf('['), b = t.lastIndexOf(']');
     if (a >= 0 && b > a) { try { const r = JSON.parse(t.slice(a, b + 1)); if (Array.isArray(r)) return r; } catch { /* fall through */ } }
     const out = []; (t.match(/\{[^{}]*\}/g) || []).forEach(o => { try { out.push(JSON.parse(o)); } catch { /* skip */ } });
@@ -118,7 +142,7 @@ function capture(id) {
     const c = C(); if (!c || !c.on || !c.st) return false; const m = ctx().chat[id]; if (!m || m.is_system) return false;
     const w = S().streamerWho; if ((w === 'char' && m.is_user) || (w === 'user' && !m.is_user)) return false;
     const text = clean(m.mes); if (!text) return false; const who = m.name || (m.is_user ? ctx().name1 : ctx().name2), b = c.st.buf, ex = b.find(x => x.id === id);
-    if (ex) { ex.text = text; ex.who = who; } else b.push({ id, who, text }); if (b.length > 80) b.shift(); save(); return true;
+    if (ex) { ex.text = text; ex.who = who; } else { b.push({ id, who, text }); c.st.msgs = (c.st.msgs || 0) + 1; } tickClock(); if (b.length > 80) b.shift(); save(); return true;
 }
 async function genViewers(force) {
     const c = C(), st = c?.st; if (!c || !c.on || !st) return;
@@ -139,7 +163,7 @@ Rules:
 - Streamer level: ${g.n}, ${g.d}.
 Cast and what each role may do (viewers outside the cast may chat, tip and request):
 ${cast}`;
-        const usr = `Stream: "${st.title}" by ${streamer()} (${pv ? (pv.kind === 'patron' ? `PRIVATE show for patron ${pv.patron} only` : `PRIVATE show for subscribers of ${TIERS[pv.tier]} and above`) : 'public'}). Viewers: ${st.viewers}. Goal: ${st.goal.label || 'none'} ${st.goal.cur}/${st.goal.target}.
+        const usr = `Stream: "${st.title}" by ${streamer()} (${pv ? (pv.kind === 'patron' ? `PRIVATE show for patron ${pv.patron} only` : `PRIVATE show for subscribers of ${TIERS[pv.tier]} and above`) : 'public'}). Viewers: ${st.viewers}. Live for ${fmtMin(uptimeMin())} of story time. Goal: ${st.goal.label || 'none'} ${st.goal.cur}/${st.goal.target}.
 Streamer bio: ${c.p.bio || '-'}. Tags: ${c.p.tags || '-'}. Boundaries: ${c.p.bounds || 'none stated'}.
 Recent chat:\n${st.feed.filter(f => f.t === 'chat').slice(-10).map(f => `${f.who}: ${f.text}`).join('\n') || '(empty)'}
 Open requests: ${st.req.filter(r => r.status === 'pending').map(r => `${r.name}: ${r.text}`).join(' | ') || 'none'}
@@ -147,7 +171,8 @@ Recent decisions: ${st.req.filter(r => r.status !== 'pending').slice(-4).map(r =
 Never use these names (muted/banned): ${[...st.muted, ...st.banned].join(', ') || 'none'}
 SCENE (on camera, newest last):\n${st.buf.slice(-6).map(b => `${b.who}: ${b.text.slice(0, 700)}`).join('\n')}
 Write ${n} new events reacting to the latest part of the scene.`;
-        const arr = parseEvents(await callLLM(s.profileId, sys, usr, 700));
+        const raw = await callLLM(s.profileId, sys, usr, 1200), arr = parseEvents(raw);
+        if (!arr.length) { console.warn('[BuzzCam] unreadable reply:', raw); const m = raw.trim() ? 'The model replied but no chat events could be read: ' + raw.trim().slice(0, 140) : 'The model returned an empty reply (reasoning models may need a bigger token budget).'; feed({ t: 'sys', text: m }); toastr.warning(m); }
         arr.slice(0, n + 2).forEach(applyEvent);
         if (st.auto) { const r = pv ? [1, Math.max(1, c.subs)] : g.v; st.viewers = clamp(Math.round(st.viewers * (1 + (Math.random() - 0.42) * 0.12)), r[0], r[1]); }
         st.peak = Math.max(st.peak, st.viewers); st.gen++;
@@ -176,12 +201,12 @@ function startStream() {
     }
     const v = !priv ? rnd(g.v[0], g.v[1]) : priv.kind === 'patron' ? 1 : Math.max(1, Math.round(c.subs * rnd(3, 9) / 100 / priv.tier));
     c.st = { title: $q('#bz-f-title').value.trim() || 'Untitled stream', start: Date.now(), viewers: v, peak: v, auto: true, goal: { label: $q('#bz-f-goal').value.trim(), target: Math.max(0, parseInt($q('#bz-f-target').value) || 0), cur: 0 }, earned: 0, tips: 0, priv, feed: [], don: [], req: [], muted: [], banned: [], buf: [], gen: 0 };
-    feed({ t: 'sys', text: priv ? 'Private show started' : 'Stream started' }); inject(); save(); fabState(); view(); head();
+    tickClock(); feed({ t: 'sys', text: priv ? 'Private show started' : 'Stream started' }); inject(); save(); fabState(); view(); head();
 }
 function stopStream() {
-    const c = C(), st = c.st; if (!st) return; const g = GRADES[S().popularity];
+    const c = C(), st = c.st; if (!st) return; tickClock(); const g = GRADES[S().popularity];
     const gained = st.priv ? 0 : rnd(0, Math.max(1, Math.round((g.s[1] - g.s[0]) / 40))); c.subs += gained;
-    c.hist.unshift({ id: uid(), title: st.title, start: st.start, end: Date.now(), peak: st.peak, earned: st.earned, tips: st.tips, gained, priv: st.priv ? (st.priv.kind === 'patron' ? 'Patron: ' + st.priv.patron : TIERS[st.priv.tier] + '+') : '', done: st.req.filter(r => r.status === 'accepted' || r.status === 'done').length, log: st.buf.slice(-60).map(b => [b.who, b.text.slice(0, 500)]), hl: st.feed.filter(f => ['tip', 'req', 'mod', 'sys'].includes(f.t)).slice(-25).map(f => f.t === 'tip' ? `${f.who} tipped ${f.amt}${f.text ? ': ' + f.text : ''}` : f.text), summary: '' });
+    c.hist.unshift({ id: uid(), title: st.title, start: st.start, end: Date.now(), mins: uptimeMin(), peak: st.peak, earned: st.earned, tips: st.tips, gained, priv: st.priv ? (st.priv.kind === 'patron' ? 'Patron: ' + st.priv.patron : TIERS[st.priv.tier] + '+') : '', done: st.req.filter(r => r.status === 'accepted' || r.status === 'done').length, log: st.buf.slice(-60).map(b => [b.who, b.text.slice(0, 500)]), hl: st.feed.filter(f => ['tip', 'req', 'mod', 'sys'].includes(f.t)).slice(-25).map(f => f.t === 'tip' ? `${f.who} tipped ${f.amt}${f.text ? ': ' + f.text : ''}` : f.text), summary: '' });
     c.st = null; inject(); save(); fabState(); view(); head();
 }
 function toggleChat(force) { const c = C(); if (!c) return; c.on = typeof force === 'boolean' ? force : !c.on; inject(); save(); fabState(); view(); head(); }
@@ -203,7 +228,8 @@ async function genComments(id) {
         const sys = `You write follower comments under a post on BuzzCam, a fictional adult-only (18+) streaming site inside a roleplay. Everyone is a fictional adult; explicit language is fine when it fits. Comment only on what the post shows. Reply with a JSON array and nothing else: [{"name":"","text":""}]. Short, varied comments (under 200 characters), honey/bee flavoured usernames allowed, same language as the post.${p.subs ? ' This is a subscribers-only post, so commenters are paying subscribers.' : ''}
 Known cast (may comment in character):\n${cast}`;
         const usr = `Streamer: ${streamer()}. Level: ${g.n}. Boundaries: ${c.p.bounds || 'none stated'}.\nPost: ${p.text || '(no text)'}\n${p.img ? 'Image: ' + (p.desc || '(attached, not described)') : ''}\nExisting comments:\n${(p.comments || []).slice(-5).map(k => `${k.name}: ${k.text}`).join('\n') || 'none'}\nWrite ${n} new comments.`;
-        const arr = parseEvents(await callLLM(S().profileId, sys, usr, 600)).filter(k => k && k.name && k.text);
+        const raw = await callLLM(S().profileId, sys, usr, 1000), arr = parseEvents(raw).filter(k => k && k.name && k.text);
+        if (!arr.length) { console.warn('[BuzzCam] unreadable reply:', raw); toastr.warning(raw.trim() ? 'The model replied but no comments could be read: ' + raw.trim().slice(0, 140) : 'The model returned an empty reply.'); }
         p.comments = (p.comments || []).concat(arr.slice(0, n + 2).map(k => ({ name: String(k.name).slice(0, 32), text: String(k.text).slice(0, 300) }))).slice(-40);
     } catch (e) { toastr.error('Comments failed: ' + (e.message || e)); }
     p.busy = 0; save(); view();
@@ -257,7 +283,7 @@ ${posts || '<div class="bz-empty">No posts yet. Your community page is waiting.<
 function vStream() {
     const c = C(), st = c.st; if (!st) return vStart(c); const g = GRADES[S().popularity];
     return `<div class="bz-livegrid"><div class="bz-colL"><section class="bz-card bz-stage"><div class="bz-banner sm" style="${c.p.thumb ? `background-image:url('${c.p.thumb}')` : ''}"><span class="bz-livepill"><i></i> LIVE</span>${st.priv ? `<span class="bz-chip lock"><i class="fa-solid fa-lock"></i> ${st.priv.kind === 'patron' ? 'Patron: ' + esc(st.priv.patron) : esc(TIERS[st.priv.tier]) + '+'}</span>` : ''}</div>
-<h2>${esc(st.title)}</h2><div class="bz-meta"><span>Uptime <b id="bz-uptime">${dur(Date.now() - st.start)}</b></span><span>${g.n} level</span><span>${fmt(c.subs)} subscribers</span></div>
+<h2>${esc(st.title)}</h2><div class="bz-meta"><span>Uptime <b id="bz-uptime" title="Story time, read from the chat">${fmtMin(uptimeMin())}</b></span><span>${g.n} level</span><span>${fmt(c.subs)} subscribers</span></div>
 <div class="bz-row"><label class="bz-inl">Viewers <input id="bz-viewers" type="number" min="0" data-live="viewers" value="${st.viewers}"></label><label class="bz-chk sm"><input type="checkbox" data-live="auto" ${st.auto ? 'checked' : ''}><span>Auto drift</span></label></div>
 <div class="bz-row"><button class="bz-btn ghost" data-act="gen"><i class="fa-solid fa-comments"></i> Generate chat now</button><button class="bz-btn danger" data-act="stop"><i class="fa-solid fa-stop"></i> Stop stream</button></div></section>
 <section class="bz-card"><h3>Goal</h3><div class="bz-meter"><div id="bz-fill"></div><span id="bz-mtxt"></span></div><div class="bz-grid2"><input data-live="goal-label" value="${esc(st.goal.label)}" placeholder="Goal name"><input data-live="goal-target" type="number" min="0" value="${st.goal.target}"></div><button class="bz-link" data-act="goal-reset">Reset progress</button></section>
@@ -281,7 +307,7 @@ function vStart(c) {
 function vHistory() {
     const c = C();
     return c.hist.length ? c.hist.map(h => `<article class="bz-card"><div class="bz-ph"><b>${esc(h.title)}</b>${h.priv ? `<span class="bz-chip lock"><i class="fa-solid fa-lock"></i> ${esc(h.priv)}</span>` : ''}<time>${new Date(h.start).toLocaleString()}</time><button class="bz-ic" data-act="hist-del" data-id="${h.id}" title="Delete"><i class="fa-solid fa-trash"></i></button></div>
-<div class="bz-meta"><span>${dur(h.end - h.start)} long</span><span>Peak ${fmt(h.peak)} viewers</span><span>${fmt(h.earned)} tokens from ${h.tips} tips</span><span>+${h.gained} subscribers</span></div>
+<div class="bz-meta"><span>${fmtMin(h.mins ?? Math.round((h.end - h.start) / 60000))} long</span><span>Peak ${fmt(h.peak)} viewers</span><span>${fmt(h.earned)} tokens from ${h.tips} tips</span><span>+${h.gained} subscribers</span></div>
 ${h.summary ? `<p class="bz-sum">${esc(h.summary)}</p>` : '<p class="bz-note">No summary yet.</p>'}
 <div class="bz-row"><button class="bz-btn ghost" data-act="hist-sum" data-id="${h.id}" ${h.busy ? 'disabled' : ''}>${h.busy ? 'Summarizing…' : h.summary ? 'Summarize again' : 'Summarize'}</button><button class="bz-link" data-act="hist-log" data-id="${h.id}">${h.show ? 'Hide' : 'Show'} on-camera log</button></div>
 ${h.show ? `<div class="bz-log">${h.log.map(l => `<p><b>${esc(l[0])}</b> ${esc(l[1])}</p>`).join('')}</div>` : ''}</article>`).join('') : '<div class="bz-empty">Finished streams show up here.</div>';
@@ -305,7 +331,7 @@ function vSettings() {
 <div class="bz-card"><h3>Honey Tokens</h3><div class="bz-grid2"><label>Money per token<input type="number" step="0.001" min="0" data-set="rate" value="${s.rate}"></label><label>Currency${s.phoneLink && phoneCurrency() ? ' (from phone)' : ''}<input data-set="currency" value="${esc(curCode())}" ${s.phoneLink && phoneCurrency() ? 'disabled' : ''}></label></div>
 ${tg('phoneLink', 'Link with Phone-ST bank')}<div class="bz-row"><button class="bz-btn ghost" data-act="phone-test">Test phone link</button></div><div id="bz-ptest" class="bz-note"></div>
 <h3>Behaviour</h3>${sel('streamerWho', 'Who is the streamer', [['char', 'The character (bot)'], ['user', 'The user'], ['both', 'Both']])}<p class="bz-note">Only the streamer's messages are on camera. Choose Both to show everyone in the chat.</p>${sel('chatMode', 'Viewer chat generation', [['auto', 'Automatic after each message'], ['manual', 'Manual (button in the stream room)']])}${sel('commentMode', 'Post comments generation', [['auto', 'Automatic when a post is published'], ['manual', 'Manual (button on each post)']])}${tg('botMods', 'Bot moderators can mute and ban')}${tg('inject', 'Let the character see chat, tips and accepted requests')}${tg('echo', 'Post tips into the main chat as system messages')}${tg('floatBtn', 'Show floating button')}
-<label>Max events per round<input type="number" min="1" max="12" data-set="maxEvents" value="${s.maxEvents}"></label><button class="bz-link" data-act="fab-reset">Reset floating button position</button></div></div>`;
+<label>Story minutes per message (used if no clock is found in chat)<input type="number" min="1" max="240" data-set="minPerMsg" value="${s.minPerMsg}"></label><label>Max events per round<input type="number" min="1" max="12" data-set="maxEvents" value="${s.maxEvents}"></label><button class="bz-link" data-act="fab-reset">Reset floating button position</button></div></div>`;
 }
 const feedRow = f => {
     const staff = f.role === 'mod' || f.role === 'cohost';
@@ -465,11 +491,12 @@ function hooks() {
         if (capture(id) && type !== 'swipe' && S().chatMode === 'auto') setTimeout(genViewers, 1500); inject(); live();
     });
     E.on(T.MESSAGE_SENT, id => capture(id));
-    E.on(T.GENERATION_STARTED, (type, p, dry) => { if (dry || type === 'quiet') return; C()?.st?.don.forEach(d => { if (d.state === 'new') d.state = 'sent'; }); inject(); });
-    E.on(T.CHAT_CHANGED, () => { C()?.hist.forEach(h => { h.busy = 0; }); C()?.posts.forEach(x => { x.busy = 0; }); draft = { img: '', text: '', desc: '' }; busy = false; inject(); fabState(); view(); head(); });
+    E.on(T.GENERATION_STARTED, (type, p, dry) => { if (dry || type === 'quiet') return; stGen = true; C()?.st?.don.forEach(d => { if (d.state === 'new') d.state = 'sent'; }); inject(); });
+    [T.GENERATION_ENDED, T.GENERATION_STOPPED].forEach(ev => { if (ev) E.on(ev, () => { stGen = false; }); });
+    E.on(T.CHAT_CHANGED, () => { C()?.hist.forEach(h => { h.busy = 0; }); C()?.posts.forEach(x => { x.busy = 0; }); draft = { img: '', text: '', desc: '' }; busy = false; stGen = false; inject(); fabState(); view(); head(); });
 }
 
 jQuery(() => {
     initSettings(); mount(); fab(); drawer(); wand(); slash(); hooks(); inject(); head();
-    setInterval(() => { const el = $q('#bz-uptime'), st = C()?.st; if (el && st) el.textContent = dur(Date.now() - st.start); }, 1000);
+    setInterval(() => { const el = $q('#bz-uptime'); if (!el || !C()?.st) return; tickClock(); el.textContent = fmtMin(uptimeMin()); el.title = C().st.clk ? 'Story time, read from the chat' : 'Estimated from message count (no clock found in chat)'; }, 2000);
 });
