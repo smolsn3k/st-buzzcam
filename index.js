@@ -142,15 +142,19 @@ function capture(id) {
     const c = C(); if (!c || !c.on || !c.st) return false; const m = ctx().chat[id]; if (!m || m.is_system) return false;
     const w = S().streamerWho; if ((w === 'char' && m.is_user) || (w === 'user' && !m.is_user)) return false;
     const text = clean(m.mes); if (!text) return false; const who = m.name || (m.is_user ? ctx().name1 : ctx().name2), b = c.st.buf, ex = b.find(x => x.id === id);
+    if (!ex || ex.text !== text) c.st.fresh = true;
     if (ex) { ex.text = text; ex.who = who; } else { b.push({ id, who, text }); c.st.msgs = (c.st.msgs || 0) + 1; } tickClock(); if (b.length > 80) b.shift(); save(); return true;
 }
+let genTimer = null;
+function schedule() { clearTimeout(genTimer); genTimer = setTimeout(() => genViewers(), 1500); }
 async function genViewers(force) {
     const c = C(), st = c?.st; if (!c || !c.on || !st) return;
     if (busy) { dirty = true; return; }
     if (!st.buf.length) { if (force === true) toastr.info('Nothing has happened on camera yet.'); return; }
-    busy = true; $q('#bz-root')?.classList.add('bz-busy');
+    busy = true; st.fresh = false; $q('#bz-root')?.classList.add('bz-busy'); console.log('[BuzzCam] generating viewer chat');
     try {
         const s = S(), g = GRADES[s.popularity], n = clamp(rnd(g.ev[0], g.ev[1]), 1, s.maxEvents), pv = st.priv;
+        const must = []; if (Math.random() < [0.3, 0.5, 0.8][s.popularity]) must.push('at least one tip'); if (Math.random() < [0.12, 0.25, 0.4][s.popularity]) must.push('one viewer request');
         const cast = c.cast.map(m => `- ${m.name} [${m.role}${m.tier ? ', tier ' + m.tier : ''}] can: ${['tip', 'request', 'moderate'].filter(k => (m.perms || ROLES[m.role])[k]).join('/') || 'chat only'}. ${m.persona || ''}`).join('\n') || '(no named cast; invent viewers)';
         const sys = `You write the live chat for BuzzCam, a fictional adult-only (18+) livestream site inside a roleplay. Everyone on it is a fictional adult. Explicit sexual language is normal here when it fits the stream.
 Rules:
@@ -170,7 +174,7 @@ Open requests: ${st.req.filter(r => r.status === 'pending').map(r => `${r.name}:
 Recent decisions: ${st.req.filter(r => r.status !== 'pending').slice(-4).map(r => `${r.name}'s request ${r.status}${r.reason ? ' (' + r.reason + ')' : ''}`).join(' | ') || 'none'}
 Never use these names (muted/banned): ${[...st.muted, ...st.banned].join(', ') || 'none'}
 SCENE (on camera, newest last):\n${st.buf.slice(-6).map(b => `${b.who}: ${b.text.slice(0, 700)}`).join('\n')}
-Write ${n} new events reacting to the latest part of the scene.`;
+Write ${n} new events reacting to the latest part of the scene.${must.length ? ' This round must include ' + must.join(' and ') + '.' : ''}`;
         const raw = await callLLM(s.profileId, sys, usr, 1200), arr = parseEvents(raw);
         if (!arr.length) { console.warn('[BuzzCam] unreadable reply:', raw); const m = raw.trim() ? 'The model replied but no chat events could be read: ' + raw.trim().slice(0, 140) : 'The model returned an empty reply (reasoning models may need a bigger token budget).'; feed({ t: 'sys', text: m }); toastr.warning(m); }
         arr.slice(0, n + 2).forEach(applyEvent);
@@ -290,7 +294,7 @@ function vStream() {
 <section class="bz-card"><h3>Tip jar</h3><div class="bz-tips">${PRESETS.map(p => `<button class="bz-tip" data-act="tip" data-a="${p.a}"><i class="fa-solid ${p.i}"></i><b>${p.n}</b><span>${p.a}</span></button>`).join('')}</div>
 <div class="bz-row"><input id="bz-tipper" placeholder="Tipper name" value="${esc(ctx().name1 || '')}"><input id="bz-custom" type="number" min="1" placeholder="Custom"><button class="bz-btn ghost" data-act="tip-custom">Tip</button></div><p class="bz-note">Simulates a viewer tip. Tokens go to your wallet.</p></section>
 <section class="bz-card"><h3>Moderation</h3><div id="bz-mod"></div></section></div>
-<div class="bz-colR"><section class="bz-card bz-chatc"><h3>Live chat <span class="bz-typing">viewers are typing…</span></h3><div id="bz-feed"></div></section>
+<div class="bz-colR"><section class="bz-card bz-chatc"><h3>Live chat <span class="bz-typing">viewers are typing…</span></h3><div id="bz-feed"></div><p id="bz-cap" class="bz-note"></p></section>
 <section class="bz-card"><h3>Donations</h3><div id="bz-don"></div></section><section class="bz-card"><h3>Requests</h3><div id="bz-req"></div></section></div></div>`;
 }
 function vStart(c) {
@@ -351,11 +355,12 @@ function view() {
     if (!c.on && tab !== 'settings') { m.innerHTML = '<div class="bz-empty"><h2>BuzzCam is off in this chat</h2><p>Nothing is captured and nothing is sent to the model.</p><button class="bz-btn" data-act="chat-on">Turn on</button></div>'; return; }
     m.innerHTML = { profile: vProfile, community: vCommunity, stream: vStream, history: vHistory, cast: vCast, settings: vSettings }[tab](); live();
 }
-function setIf(sel, html) { const el = $q(sel); if (el && !el.contains(document.activeElement)) el.innerHTML = html; }
+function setIf(sel, html) { const el = $q(sel), a = document.activeElement; if (el && !(el.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName))) el.innerHTML = html; }
 function live() {
     head(); const st = C()?.st; if (!isOpen || tab !== 'stream' || !st || !$q('#bz-feed')) return;
     const fe = $q('#bz-feed'), stick = fe.scrollTop + fe.clientHeight >= fe.scrollHeight - 50;
     fe.innerHTML = st.feed.slice(-80).map(feedRow).join(''); if (stick) fe.scrollTop = fe.scrollHeight;
+    const cap = $q('#bz-cap'); if (cap) cap.textContent = `${st.buf.length} on-camera messages captured${st.fresh ? ', chat round pending' : ''}. ${S().chatMode === 'auto' ? 'Chat generates automatically after each message.' : 'Manual mode: use Generate chat now.'}`;
     setIf('#bz-don', donHtml(st)); setIf('#bz-req', reqHtml(st)); setIf('#bz-mod', modHtml(st));
     const vi = $q('#bz-viewers'); if (vi && document.activeElement !== vi) vi.value = st.viewers;
     const pct = st.goal.target > 0 ? clamp(st.goal.cur / st.goal.target * 100, 0, 100) : 0;
@@ -381,7 +386,7 @@ const ACT = {
     tip: t => tip(+t.dataset.a), 'tip-custom': () => tip(parseInt($q('#bz-custom').value) || 0),
     mute: t => { const st = C().st, n = t.dataset.w; st.muted.push(n.toLowerCase()); feed({ t: 'sys', text: `${n} was muted` }); save(); live(); },
     ban: t => { const st = C().st, n = t.dataset.w; st.banned.push(n.toLowerCase()); feed({ t: 'sys', text: `${n} was banned` }); save(); live(); },
-    unmod: t => { const st = C().st, l = st[t.dataset.l]; l.splice(l.indexOf(t.dataset.w.toLowerCase()), 1); save(); live(); },
+    unmod: t => { const st = C().st, l = st[t.dataset.l], i = l.indexOf(t.dataset.w.toLowerCase()); if (i >= 0) l.splice(i, 1); feed({ t: 'sys', text: `${t.dataset.w} was un${t.dataset.l === 'banned' ? 'banned' : 'muted'}` }); save(); live(); },
     'don-read': (t, id) => { C().st.don.find(d => d.id === id).state = 'read'; inject(); save(); live(); },
     'req-accept': (t, id) => { const r = C().st.req.find(x => x.id === id); r.status = 'accepted'; if (r.price) gain(r.name, r.price, 'Paid request: ' + r.text); feed({ t: 'sys', text: `Accepted ${r.name}'s request` }); inject(); save(); live(); },
     'req-decline': (t, id) => { C().st.req.find(x => x.id === id).decl = true; live(); },
@@ -486,10 +491,11 @@ function wand() {
 function slash() { try { const x = ctx(); x.SlashCommandParser.addCommandObject(x.SlashCommand.fromProps({ name: 'buzzcam', callback: () => { openWin(); return ''; }, helpString: 'Open BuzzCam' })); } catch (e) { console.warn('[BuzzCam] slash command unavailable', e); } }
 function hooks() {
     const x = ctx(), E = x.eventSource, T = x.event_types;
-    E.on(T.MESSAGE_RECEIVED, (id, type) => {
-        const st = C()?.st; if (st) { st.don.forEach(d => { if (d.state === 'sent') d.state = 'read'; }); }
-        if (capture(id) && type !== 'swipe' && S().chatMode === 'auto') setTimeout(genViewers, 1500); inject(); live();
-    });
+    const onMsg = (id, type) => {
+        const st = C()?.st; if (st) st.don.forEach(d => { if (d.state === 'sent') d.state = 'read'; });
+        capture(id); if (C()?.st?.fresh && type !== 'swipe' && S().chatMode === 'auto') schedule(); inject(); live();
+    };
+    E.on(T.MESSAGE_RECEIVED, onMsg); if (T.CHARACTER_MESSAGE_RENDERED) E.on(T.CHARACTER_MESSAGE_RENDERED, onMsg);
     E.on(T.MESSAGE_SENT, id => capture(id));
     E.on(T.GENERATION_STARTED, (type, p, dry) => { if (dry || type === 'quiet') return; stGen = true; C()?.st?.don.forEach(d => { if (d.state === 'new') d.state = 'sent'; }); inject(); });
     [T.GENERATION_ENDED, T.GENERATION_STOPPED].forEach(ev => { if (ev) E.on(ev, () => { stGen = false; }); });
