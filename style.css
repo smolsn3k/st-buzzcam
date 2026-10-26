@@ -151,3 +151,12 @@
 .bz-cm { margin: 8px 0 2px; padding-left: 10px; border-left: 3px solid var(--line); }
 .bz-cm p { margin: 4px 0; font-size: .9em; line-height: 1.4; }
 .bz-cm b { color: var(--honey); }
+.bz-log.tall { max-height: 340px; height: 340px; font-size: .8em; }
+.bz-log.tall div { padding: 2px 0; word-break: break-word; }
+.bz-log time { color: var(--dim); margin-right: 6px; }
+.bz-log .l-w { color: var(--honey); }
+.bz-log .l-e { color: #ff8a80; }
+.bz-cr { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; padding: 6px 0; border-bottom: 1px dashed var(--line); font-size: .88em; }
+.bz-cr.ok i { color: var(--ok); }
+.bz-cr.bad i { color: var(--live); }
+.bz-cr span { color: var(--dim); }
